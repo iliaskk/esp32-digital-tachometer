@@ -3,28 +3,51 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// 1. Variables 
+// Variables 
 volatile unsigned long lastSparkTime = 0;
-int sparkPin = 25; // Pin connected to the spark signal
-volatile unsigned long RpmDivide = 0;
-const unsigned long debounceDelay = 3000; //microseconds aka 3 millisecond
-volatile unsigned long lastDisplayTime = 0;
-volatile unsigned long RPM = 0;
+const uint8_t sparkPin = 25; // Pin connected to the spark signal
+volatile unsigned long timeBetweenSparks = 0;
+const unsigned long debounceDelay = 3000; // 3000 microseconds = 3 milliseconds
+unsigned long lastDisplayTime = 0;
+unsigned long RPM = 0;
+unsigned long lastRpmState = 9999; //Impossible Initial State
 
-//2. Backround 
+// ISR Backround 
 void IRAM_ATTR recordPulse() {
-  unsigned long currentTime;
-  unsigned long timeDiff; //IRAM_ATTR gia na ginei to ISR pio grigora(apo8hkeush sthn RAM)
-currentTime = micros();
-timeDiff = currentTime - lastSparkTime;
+    unsigned long currentIsrTime = micros();
+    unsigned long sparkNew = currentIsrTime - lastSparkTime;
 
-if (timeDiff > debounceDelay) {
-  RpmDivide = timeDiff;
-  lastSparkTime = currentTime; 
-}
+    if (sparkNew > debounceDelay) {
+        timeBetweenSparks = sparkNew;
+        lastSparkTime = currentIsrTime;
+    }
 }
 
-// 3. Initial Setup
+void calculateRPM() { 
+   noInterrupts();
+    if (micros() - lastSparkTime > 1000000) {  // 1 second
+      RPM = 0;  // engine stopped
+    } else if (timeBetweenSparks > 0) {
+      RPM = 60000000 / timeBetweenSparks;  // 60,000,000 microseconds = 1 minute
+    } else {
+      RPM = 0;
+    }
+    interrupts();
+}
+
+// Display UI; Change-Detection State for Anti-flickering
+ void updateDisplay() { 
+   if (RPM != lastRpmState) { //an einai to idio me to proigoumeno, den xreiazetai na graftei sthn o8onh
+      tft.setCursor(10, 40);
+      tft.print("RPM: ");
+      tft.print(RPM);
+      tft.print("   "); //(spaces) λειτουργούν σαν «έξυπνη γόμα», σβήνοντας μόνο τα ψηφία που περισσεύουν δεξιά, χωρίς να αναβοσβήνουν όλη την περιοχή.
+      Serial.printf("RPM: %lu\n", RPM);
+      lastRpmState = RPM;
+    }
+ }
+
+//Initial Setup
 void setup() {
   tft.init();
   tft.setRotation(1); 
@@ -38,27 +61,13 @@ void setup() {
   
   pinMode(sparkPin, INPUT_PULLUP); 
   attachInterrupt(digitalPinToInterrupt(sparkPin), recordPulse , RISING); //Σύνδεσε έναν συναγερμό στο Pin 25. Μόλις δεις την τάση να ανεβαίνει (σπινθήρας), τρέξε τη συνάρτηση recordPulse για να αυξήσεις τον μετρητή
-}//attachInterrupt: sunagermos/ISR
+} //attachInterrupt: sunagermos/ISR
 
-
-// 4. Main Loop
-void loop() {
- if (millis() - lastDisplayTime > 100) { 
-  noInterrupts();
-  if (micros() - lastSparkTime > 1000000) { //an perase 1 deuterolepto apo ton teleutaio spinthira, tote to RPM einai 0
-    RPM = 0;
-  } else if (RpmDivide > 0) {
-    RPM = 60000000 / RpmDivide; }
-    else RPM = 0;
-  interrupts();
-
-tft.fillRect(10, 70, 100, 30, TFT_BLACK); // Σβήσε το παλιό νούμερο
-tft.setCursor(10, 70);
-tft.print("RPM: ");
-tft.print(RPM);
-
-  Serial.printf("RPM: %lu\n", RPM);
-  lastDisplayTime = millis();
+void loop() { // main loop
+  unsigned long currentLoopTime = millis(); //Δεν βάζουμε ΠΟΤΕ την ίδια μεταβλητή να διαβάζει micros() (εκατομμυριοστά) και μετά από λίγο millis()
+ if (currentLoopTime - lastDisplayTime >= 100) { //Ενημέρωση οθόνης κάθε 1 δευτερόλεπτο
+  calculateRPM(); //Υπολογισμός RPM
+  updateDisplay(); //Ενημέρωση οθόνης
+  lastDisplayTime = currentLoopTime; //Αποθήκευση χρόνου τελευταίας ενημέρωσης
+  }
 } 
- }
-
