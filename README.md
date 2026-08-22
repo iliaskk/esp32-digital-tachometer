@@ -32,5 +32,5 @@ This project is built using **PlatformIO**.
 
 1. Install [VS Code](https://code.visualstudio.com/) and the [PlatformIO IDE extension](https://platformio.org/install/ide?install=vscode).
 2. Clone this repository:
-   ```bash
-   git clone [https://github.com/YOUR_USERNAME/esp32-digital-tachometer.git](https://github.com/YOUR_USERNAME/esp32-digital-tachometer.git)
+ ```bash
+git clone https://github.com/iliaskk/esp32-digital-tachometer.git
