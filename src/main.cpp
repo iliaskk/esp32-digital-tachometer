@@ -1,55 +1,74 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <cinttypes>
+
+#include <atomic>  //++
+#include <cstdint> //++
 
 TFT_eSPI tft = TFT_eSPI();
 
-const uint8_t sparkPin = 25;                      // Pin connected to the spark signal
-const unsigned long debounceDelay = 3000;         // 3000 microseconds = 3 milliseconds
-const unsigned long microsPerMinute = 60'000'000; //'; magic number avoiding
+const uint8_t sparkPin = 25;                 // Pin connected to the spark signal
+const uint32_t microsPerMinute = 60'000'000; //'; magic number avoiding
+const uint32_t engineTimeoutLimit = 1'000'000;
+const uint32_t impossibleInitialRpm = 9999;
+const uint32_t displayRefreshRate = 100;
+const uint32_t maxEngineRpm = 9500;
+const uint32_t debounceDelay = microsPerMinute / maxEngineRpm;
 
 // Data Encapsulation (Το "κουτί" με τις μεταβλητές που αλλάζουν)
 struct EngineData
 {
-    volatile unsigned long lastSparkTime;
-    volatile unsigned long timeBetweenSparks;
-    unsigned long currentRpm;
-    unsigned long lastRpmState;
-    unsigned long lastDisplayTime;
+    volatile uint32_t lastSparkTime;
+    volatile uint32_t timeBetweenSparks;
+    uint32_t currentRpm;
+    uint32_t lastRpmState;
+    uint32_t lastDisplayTime;
 };
 
 // Αρχικοποίηση του struct με τις αρχικές τιμές
-EngineData engine = {0, 0, 0, 9999, 0}; // 9999 is an Impossible Initial State
+EngineData engine = {0, 0, 0, impossibleInitialRpm, 0};
 
 // ISR Background
 void IRAM_ATTR recordPulse()
 {
-    unsigned long currentIsrTime = micros();
-    unsigned long sparkNew = currentIsrTime - engine.lastSparkTime;
+    uint32_t localIsrTime = micros();
+    uint32_t localSparkNew = localIsrTime - engine.lastSparkTime;
 
-    if (sparkNew > debounceDelay)
+    if (localSparkNew > debounceDelay)
     {
-        engine.timeBetweenSparks = sparkNew;
-        engine.lastSparkTime = currentIsrTime;
+        engine.timeBetweenSparks = localSparkNew;
+        engine.lastSparkTime = localIsrTime;
     }
 }
 
-void calculateRPM()
+void calculateRpm()
 {
+    // we use local variables so we can run calculateRpm() and then pass the data to the engine struct to achieve State Management
+    uint32_t localLastSparkTime = 0;
+    uint32_t localTimeBetweenSparks = 0;
+    uint32_t localCurrentRpm = 0;
+    uint32_t localCurrentTime = micros();
+
     noInterrupts();
-    if (micros() - engine.lastSparkTime > 1000000) // 1 second
+    localLastSparkTime = engine.lastSparkTime;
+    localTimeBetweenSparks = engine.timeBetweenSparks;
+    interrupts();
+
+    if ((localCurrentTime - localLastSparkTime > engineTimeoutLimit) || (localTimeBetweenSparks == 0))
     {
 
-        engine.currentRpm = 0; // engine stopped
-    }
-    else if (engine.timeBetweenSparks > 0)
-    {
-        engine.currentRpm = microsPerMinute / engine.timeBetweenSparks;
+        localCurrentRpm = 0; // engine stopped
+
+        noInterrupts();
+        engine.lastSparkTime = localCurrentTime; // Prevents micros() 71-min rollover bug
+        interrupts();
     }
     else
     {
-        engine.currentRpm = 0;
+        localCurrentRpm = microsPerMinute / localTimeBetweenSparks;
     }
-    interrupts();
+
+    engine.currentRpm = localCurrentRpm;
 }
 
 // Display UI; Change-Detection State for Anti-flickering
@@ -61,7 +80,7 @@ void updateDisplay()
         tft.print("RPM: ");
         tft.print(engine.currentRpm);
         tft.print("   "); // works like a "smart eraser"
-        Serial.printf("RPM: %lu\n", engine.currentRpm);
+        Serial.printf("RPM: %" PRIu32 "\n", engine.currentRpm);
         engine.lastRpmState = engine.currentRpm;
     }
 }
@@ -85,13 +104,12 @@ void setup()
 
 void loop()
 {
-    unsigned long currentLoopTime = millis(); // Δεν βάζουμε ΠΟΤΕ την ίδια μεταβλητή να διαβάζει micros() (εκατομμυριοστά) και μετά από λίγο millis()
+    uint32_t localCurrentLoopTime = millis(); // Δεν βάζουμε ΠΟΤΕ την ίδια μεταβλητή να διαβάζει micros() (εκατομμυριοστά) και μετά από λίγο millis()
 
-    if (currentLoopTime - engine.lastDisplayTime >= 100)
+    if (localCurrentLoopTime - engine.lastDisplayTime >= displayRefreshRate)
     {
-        // Ενημέρωση οθόνης κάθε 1 δευτερόλεπτο
-        calculateRPM();
+        calculateRpm();
         updateDisplay();
-        engine.lastDisplayTime = currentLoopTime; // Αποθήκευση χρόνου τελευταίας ενημέρωσης
+        engine.lastDisplayTime = localCurrentLoopTime; // Αποθήκευση χρόνου τελευταίας ενημέρωσης
     }
 }
