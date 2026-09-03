@@ -2,26 +2,34 @@
 #include <TFT_eSPI.h>
 #include <cinttypes>
 
-#include <atomic>  //++
+#include <atomic>  //** */ volatile + noInterrupts() is single-core-only synchronization** fix needed
 #include <cstdint> //++
 
 TFT_eSPI tft = TFT_eSPI();
 
-const uint8_t sparkPin = 25;                 // Pin connected to the spark signal
-const uint32_t microsPerMinute = 60'000'000; //'; magic number avoiding
+const uint8_t sparkPin = 25; // Pin connected to the spark signal
+const uint32_t microsPerMinute = 60'000'000;
 const uint32_t engineTimeoutLimit = 1'000'000;
 const uint32_t impossibleInitialRpm = 9999;
 const uint32_t displayRefreshRate = 100;
 const uint32_t maxEngineRpm = 9500;
-const uint32_t debounceDelay = microsPerMinute / maxEngineRpm;
+const uint32_t debounceDelay = microsPerMinute / maxEngineRpm; // debounceDelay is derived from maxEngineRpm. These are unrelated quantities: the debounce window is a property of the input signal (glitch filter), and it silently changes if the redline constant is edited. Expressing a filter as "one period at max RPM" is fragile at the top of the range, combined with the strict >
 
 // Data Encapsulation (Το "κουτί" με τις μεταβλητές που αλλάζουν)
-class tachometer
+class tachometer // too many responsibilities?
 {
 
 private: // Εδώ μπαίνουν οι μεταβλητές που δεν θέλουμε να πειράζει η loop()
     uint32_t currentRpm;
     uint32_t lastRpmState;
+
+    enum class EngineState // προσφέρει Type Safety,Είναι απλώς ένα αυστηρό, πεπερασμένο σύνολο από ετικέτες,αναγκάζει μια μεταβλητή να παίρνει τιμές αποκλειστικά μέσα από αυτό το σύνολο,Σε υποχρεώνει να γράφεις πάντα το όνομά του από μπροστά (π.χ. EngineState::ENGINE_STOPPED), οπότε δεν υπάρχει καμία περίπτωση να μπερδευτεί με κάτι άλλο στο πρόγραμμα
+    {
+        ENGINE_STOPPED,
+        ENGINE_RUNNING
+    };
+
+    EngineState currentState = EngineState::ENGINE_STOPPED;
 
 public:                                  // Οι μεταβλητές που πρέπει αναγκαστικά να βλέπει το ISR.
     volatile uint32_t timeBetweenSparks; // αλλάζει τιμή μέσα στο (ISR)
@@ -45,7 +53,7 @@ public:                                  // Οι μεταβλητές που π�
         uint32_t localLastSparkTime = 0;
         uint32_t localTimeBetweenSparks = 0;
         uint32_t localCurrentRpm = 0;
-        uint32_t localCurrentTime = micros();
+        uint32_t localCurrentTime = micros(); // micros() is sampled outside the critical section
 
         noInterrupts(); // software interrupt
         localLastSparkTime = lastSparkTime;
@@ -54,15 +62,16 @@ public:                                  // Οι μεταβλητές που π�
 
         if ((localCurrentTime - localLastSparkTime > engineTimeoutLimit) || (localTimeBetweenSparks == 0))
         {
-
-            localCurrentRpm = 0; // engine stopped
-
+            currentState = EngineState::ENGINE_STOPPED; // Engine Stop Detection/State Machine
+            
             noInterrupts();
-            lastSparkTime = localCurrentTime; // Prevents micros() 71-min rollover bug
+            localCurrentRpm = 0;
+            timeBetweenSparks = 0; // Engine Stop Detection
             interrupts();
         }
         else
         {
+            currentState = EngineState::ENGINE_RUNNING;
             localCurrentRpm = microsPerMinute / localTimeBetweenSparks;
         }
 
@@ -70,11 +79,11 @@ public:                                  // Οι μεταβλητές που π�
     }
 
     // Display UI; Change-Detection State for Anti-Flickering
-    void(updateDisplay)()
+    void(updateDisplay)() // 8elei douleia
     {
         if (currentRpm != lastRpmState) // if rpm has changed, update the display
         {
-            tft.setCursor(10, 40);
+            tft.setCursor(10, 40); // magic value (++  sentinel 9999, the 1-second timeout), and the sentinel isn't actually "impossible" given the missing clamp.)
             tft.print("RPM: ");
             tft.print(currentRpm);
             tft.print("   "); // works like a "smart eraser"
