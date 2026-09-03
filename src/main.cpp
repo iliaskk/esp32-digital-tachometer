@@ -7,21 +7,24 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-const uint8_t sparkPin = 25; // Pin connected to the spark signal
-const uint32_t microsPerMinute = 60'000'000;
-const uint32_t engineTimeoutLimit = 1'000'000;
-const uint32_t impossibleInitialRpm = 9999;
+const uint8_t SPARK_PIN = 25; // Pin connected to the spark signal
+const uint32_t MICROS_PER_MINUTE = 60'000'000;
+const uint32_t ENGINE_TIMEOUT_US = 1'000'000;
+const uint32_t INVALID_RPM_STATE = 9999;
+const uint32_t MAX_RPM = 9500;
 const uint32_t displayRefreshRate = 100;
-const uint32_t maxEngineRpm = 9500;
-const uint32_t debounceDelay = microsPerMinute / maxEngineRpm; // debounceDelay is derived from maxEngineRpm. These are unrelated quantities: the debounce window is a property of the input signal (glitch filter), and it silently changes if the redline constant is edited. Expressing a filter as "one period at max RPM" is fragile at the top of the range, combined with the strict >
+const uint32_t debounceDelay = MICROS_PER_MINUTE / MAX_RPM; // debounceDelay is derived from MAX_RPM. These are unrelated quantities: the debounce window is a property of the input signal (glitch filter), and it silently changes if the redline constant is edited. Expressing a filter as "one period at max RPM" is fragile at the top of the range, combined with the strict >
+
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; // spinlock for ISR synchronizΕίναι μια μακροεντολή αρχικοποίησης.portMUX_INITIALIZER_UNLOCKED Λέει στο σύστημα κατά το boot: «Αυτή η κλειδαριά ξεκινάει ανοιχτή (unlocked), μην μπλοκάρεις κανέναν ακόμα».Όταν βάζεις Spinlock και στις δύο πλευρές, όποιος όποιος καλέσει πρώτος το portENTER_CRITICAL κλειδώνει.To tachometer είναι ένα σειριακό πρόγραμμα (loop) που δέχεται τυχαίες, απροειδοποίητες "επισκέψεις" από το hardware (recordPulse).
+//Το Spinlock είναι ο μηχανισμός που επιβάλλει τάξη σε αυτό το χάος: αναγκάζει τον ασύγχρονο εισβολέα και τον σειριακό εκτελεστή να συμπεριφερθούν σαν να διαβάζονται γραμμή-γραμμή στο μοναδικό σημείo που αγγίζουν τα ίδια bytes στη RAM.
 
 // Data Encapsulation (Το "κουτί" με τις μεταβλητές που αλλάζουν)
-class tachometer // too many responsibilities?
+class Tachometer // too many responsibilities?
 {
 
-private: // Εδώ μπαίνουν οι μεταβλητές που δεν θέλουμε να πειράζει η loop()
-    uint32_t currentRpm;
-    uint32_t lastRpmState;
+private:                   // Εδώ μπαίνουν οι μεταβλητές που δεν θέλουμε να πειράζει η loop()
+    uint32_t currentRpm;   // Είναι το τελικό αποτέλεσμα του μαθηματικού υπολογισμού. Πρέπει να αλλάζει μόνο μέσα από τη μέθοδο calculateRpm().
+    uint32_t lastRpmState; // Χρησιμοποιείται αποκλειστικά από την updateDisplay() για Anti-Flickering
 
     enum class EngineState // προσφέρει Type Safety,Είναι απλώς ένα αυστηρό, πεπερασμένο σύνολο από ετικέτες,αναγκάζει μια μεταβλητή να παίρνει τιμές αποκλειστικά μέσα από αυτό το σύνολο,Σε υποχρεώνει να γράφεις πάντα το όνομά του από μπροστά (π.χ. EngineState::ENGINE_STOPPED), οπότε δεν υπάρχει καμία περίπτωση να μπερδευτεί με κάτι άλλο στο πρόγραμμα
     {
@@ -29,21 +32,21 @@ private: // Εδώ μπαίνουν οι μεταβλητές που δεν θέ
         ENGINE_RUNNING
     };
 
-    EngineState currentState = EngineState::ENGINE_STOPPED;
+    EngineState currentState = EngineState::ENGINE_STOPPED; // Η επίσημη κατάσταση λειτουργίας του κινητήρα. Αλλάζει αυστηρά βάσει των κανόνων του state machine μέσα στην κλάση, προστατεύοντας το σύστημα από ακούσιες μεταβολές.
 
 public:                                  // Οι μεταβλητές που πρέπει αναγκαστικά να βλέπει το ISR.
-    volatile uint32_t timeBetweenSparks; // αλλάζει τιμή μέσα στο (ISR)
-    volatile uint32_t lastSparkTime;     // αλλάζει τιμή μέσα στο (ISR)
+    volatile uint32_t timeBetweenSparks; // both are used for calculateRpm(),recordPulse()
+    volatile uint32_t lastSparkTime;     // both are used for calculateRpm(),recordPulse() (which is why a spinlock is needed)
     uint32_t lastDisplayTime;
 
     //  Constructor
-    tachometer()
+    Tachometer()
     {
         lastSparkTime = 0;
         timeBetweenSparks = 0;
         currentRpm = 0;
         lastDisplayTime = 0;
-        lastRpmState = impossibleInitialRpm;
+        lastRpmState = INVALID_RPM_STATE;
     }
 
     // Οι "Λειτουργίες" (API)
@@ -55,31 +58,36 @@ public:                                  // Οι μεταβλητές που π�
         uint32_t localCurrentRpm = 0;
         uint32_t localCurrentTime = micros(); // micros() is sampled outside the critical section
 
-        noInterrupts(); // software interrupt
+        portENTER_CRITICAL(&timerMux); // software interrupt,& epeidh οι δύο πυρήνες κοιτάζουν και πειράζουν το ίδιο ακριβώς byte στη RAM.
         localLastSparkTime = lastSparkTime;
         localTimeBetweenSparks = timeBetweenSparks;
-        interrupts();
+        portEXIT_CRITICAL(&timerMux);
 
-        if ((localCurrentTime - localLastSparkTime > engineTimeoutLimit) || (localTimeBetweenSparks == 0))
+        if ((localCurrentTime - localLastSparkTime > ENGINE_TIMEOUT_US) || (localTimeBetweenSparks == 0))
         {
             currentState = EngineState::ENGINE_STOPPED; // Engine Stop Detection/State Machine
-            
-            noInterrupts();
             localCurrentRpm = 0;
+
+            portENTER_CRITICAL(&timerMux);
             timeBetweenSparks = 0; // Engine Stop Detection
-            interrupts();
+            portEXIT_CRITICAL(&timerMux);
         }
         else
         {
             currentState = EngineState::ENGINE_RUNNING;
-            localCurrentRpm = microsPerMinute / localTimeBetweenSparks;
+            localCurrentRpm = MICROS_PER_MINUTE / localTimeBetweenSparks;
+
+            if (localCurrentRpm > MAX_RPM)
+            {
+                localCurrentRpm = currentRpm; // reject glitch, keep the last valid RPM
+            }
         }
 
         currentRpm = localCurrentRpm;
     }
 
     // Display UI; Change-Detection State for Anti-Flickering
-    void(updateDisplay)() // 8elei douleia
+    void(updateDisplay)() //Τι κάνει: Διαβάζει το currentRpm και το συγκρίνει με το lastRpmState.
     {
         if (currentRpm != lastRpmState) // if rpm has changed, update the display
         {
@@ -93,7 +101,7 @@ public:                                  // Οι μεταβλητές που π�
     }
 };
 
-tachometer tacho; // object of the tachometer class
+Tachometer tacho; // object of the Tachometer class
 
 // ISR Background
 void IRAM_ATTR recordPulse()
@@ -101,10 +109,14 @@ void IRAM_ATTR recordPulse()
     uint32_t localIsrTime = micros();
     uint32_t localSparkNew = localIsrTime - tacho.lastSparkTime;
 
-    if (localSparkNew > debounceDelay)
+    if (localSparkNew >= debounceDelay)
     {
+        portENTER_CRITICAL_ISR(&timerMux); // mesa sto if gia na mhn kleidwnei  to ka8e hlektriko parasito
+
         tacho.timeBetweenSparks = localSparkNew;
         tacho.lastSparkTime = localIsrTime;
+
+        portEXIT_CRITICAL_ISR(&timerMux);
     }
 }
 
@@ -121,8 +133,8 @@ void setup()
     tft.setCursor(10, 10);
     tft.println("System Ready!");
 
-    pinMode(sparkPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(sparkPin), recordPulse, RISING); // Σύνδεσε έναν συναγερμό στο Pin 25. Μόλις δεις την τάση να ανεβαίνει (σπινθήρας), τρέξε τη συνάρτηση recordPulse για να αυξήσεις τον μετρητή
+    pinMode(SPARK_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(SPARK_PIN), recordPulse, RISING); // Σύνδεσε έναν συναγερμό στο Pin 25. Μόλις δεις την τάση να ανεβαίνει (σπινθήρας), τρέξε τη συνάρτηση recordPulse για να αυξήσεις τον μετρητή
 } // attachInterrupt; an alarm/HARDWARE interrupt
 
 void loop()
