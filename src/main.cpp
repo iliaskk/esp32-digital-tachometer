@@ -10,15 +10,18 @@ TFT_eSPI tft = TFT_eSPI();
 const uint8_t SPARK_PIN = 25; // Pin connected to the spark signal
 const uint32_t MICROS_PER_MINUTE = 60'000'000;
 const uint32_t ENGINE_TIMEOUT_US = 1'000'000;
-const uint32_t INVALID_RPM_STATE = 9999;
+const uint32_t INVALID_RPM_STATE = 0xFFFFFFFF;
 const uint32_t MAX_RPM = 9500;
 const uint32_t displayRefreshRate = 100;
-const uint32_t debounceDelay = MICROS_PER_MINUTE / MAX_RPM; // debounceDelay is derived from MAX_RPM. These are unrelated quantities: the debounce window is a property of the input signal (glitch filter), and it silently changes if the redline constant is edited. Expressing a filter as "one period at max RPM" is fragile at the top of the range, combined with the strict >
+const uint32_t debounceDelay = MICROS_PER_MINUTE / MAX_RPM; // debounceDelay is derived from MAX_RPM. These are unrelated quantities: the debounce window is a property of the input signal (glitch filter), and it silently changes if the redline constant is edited. Expressing a filter as "one period at max RPM" is fragile at the top of the range, combined with the strict >   , /++ RC Low-Pass Filter Implemantation needed
+const uint8_t TFT_RPM_X = 10;
+const uint8_t TFT_RPM_Y = 40;
 
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; // spinlock for ISR synchronizΕίναι μια μακροεντολή αρχικοποίησης.portMUX_INITIALIZER_UNLOCKED Λέει στο σύστημα κατά το boot: «Αυτή η κλειδαριά ξεκινάει ανοιχτή (unlocked), μην μπλοκάρεις κανέναν ακόμα».Όταν βάζεις Spinlock και στις δύο πλευρές, όποιος όποιος καλέσει πρώτος το portENTER_CRITICAL κλειδώνει.To tachometer είναι ένα σειριακό πρόγραμμα (loop) που δέχεται τυχαίες, απροειδοποίητες "επισκέψεις" από το hardware (recordPulse).
-//Το Spinlock είναι ο μηχανισμός που επιβάλλει τάξη σε αυτό το χάος: αναγκάζει τον ασύγχρονο εισβολέα και τον σειριακό εκτελεστή να συμπεριφερθούν σαν να διαβάζονται γραμμή-γραμμή στο μοναδικό σημείo που αγγίζουν τα ίδια bytes στη RAM.
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; // spinlock for ISR synchronization
+// Είναι μια μακροεντολή αρχικοποίησης.portMUX_INITIALIZER_UNLOCKED Λέει στο σύστημα κατά το boot: «Αυτή η κλειδαριά ξεκινάει ανοιχτή (unlocked), μην μπλοκάρεις κανέναν ακόμα».Όταν βάζεις Spinlock και στις δύο πλευρές, όποιος όποιος καλέσει πρώτος το portENTER_CRITICAL κλειδώνει.To tachometer είναι ένα σειριακό πρόγραμμα (loop) που δέχεται τυχαίες, απροειδοποίητες "επισκέψεις" από το hardware (recordPulse).
+// Το Spinlock είναι ο μηχανισμός που επιβάλλει τάξη σε αυτό το χάος: αναγκάζει τον ασύγχρονο εισβoλέα και τον σειριακό εκτελεστή να συμπεριφερθoύν σαν να διαβάζoυν γραμμή-γραμμή στo μoναδικό σημειo που αγγίζουν τα ιδια bytes στη RAM.
 
-// Data Encapsulation (Το "κουτί" με τις μεταβλητές που αλλάζουν)
+// Data Encapsulation (Τo "κουτί" μe τiς μεταβλητές που αλλάζουν)
 class Tachometer // too many responsibilities?
 {
 
@@ -35,7 +38,7 @@ private:                   // Εδώ μπαίνουν οι μεταβλητές 
     EngineState currentState = EngineState::ENGINE_STOPPED; // Η επίσημη κατάσταση λειτουργίας του κινητήρα. Αλλάζει αυστηρά βάσει των κανόνων του state machine μέσα στην κλάση, προστατεύοντας το σύστημα από ακούσιες μεταβολές.
 
 public:                                  // Οι μεταβλητές που πρέπει αναγκαστικά να βλέπει το ISR.
-    volatile uint32_t timeBetweenSparks; // both are used for calculateRpm(),recordPulse()
+    volatile uint32_t timeBetweenSparks; // both are used for calculateRpm(),recordPulse(). volatile Μην την αποθηκεύσεις προσωρινά σε κάποιον γρήγορο CPU register, διότι η τιμή της μπορεί να αλλάξει ανά πάσα στιγμή (για το calculateRpm)
     volatile uint32_t lastSparkTime;     // both are used for calculateRpm(),recordPulse() (which is why a spinlock is needed)
     uint32_t lastDisplayTime;
 
@@ -50,27 +53,26 @@ public:                                  // Οι μεταβλητές που π�
     }
 
     // Οι "Λειτουργίες" (API)
-    void(calculateRpm)()
+    void calculateRpm()
     {
         // we use local variables so we can run calculateRpm() and then pass the data to the engine struct to achieve State Management
         uint32_t localLastSparkTime = 0;
         uint32_t localTimeBetweenSparks = 0;
         uint32_t localCurrentRpm = 0;
-        uint32_t localCurrentTime = micros(); // micros() is sampled outside the critical section
+        uint32_t localCurrentTime;
 
         portENTER_CRITICAL(&timerMux); // software interrupt,& epeidh οι δύο πυρήνες κοιτάζουν και πειράζουν το ίδιο ακριβώς byte στη RAM.
+
+        localCurrentTime = micros(); // an εκτελείται έξω (πριν) από το portENTER_CRITICAL -> window of vulnerability) ανάμεσα στη λήψη του χρόνου και την ανάγνωση των μεταβλητών της ISR. -> race condition
         localLastSparkTime = lastSparkTime;
         localTimeBetweenSparks = timeBetweenSparks;
+
         portEXIT_CRITICAL(&timerMux);
 
         if ((localCurrentTime - localLastSparkTime > ENGINE_TIMEOUT_US) || (localTimeBetweenSparks == 0))
         {
             currentState = EngineState::ENGINE_STOPPED; // Engine Stop Detection/State Machine
             localCurrentRpm = 0;
-
-            portENTER_CRITICAL(&timerMux);
-            timeBetweenSparks = 0; // Engine Stop Detection
-            portEXIT_CRITICAL(&timerMux);
         }
         else
         {
@@ -85,16 +87,18 @@ public:                                  // Οι μεταβλητές που π�
 
         currentRpm = localCurrentRpm;
     }
-
-    // Display UI; Change-Detection State for Anti-Flickering
-    void(updateDisplay)() //Τι κάνει: Διαβάζει το currentRpm και το συγκρίνει με το lastRpmState.
+    void updateDisplay() // Τι κάνει: Διαβάζει το currentRpm και το συγκρίνει με το lastRpmState. Επιτρέπει το I/O προς το hardware της οθόνης αυστηρά και μόνο όταν τα δεδομένα (state) έχουν υποστεί μετάλλαξη (mutation)
     {
-        if (currentRpm != lastRpmState) // if rpm has changed, update the display
+        if (currentRpm != lastRpmState)
         {
-            tft.setCursor(10, 40); // magic value (++  sentinel 9999, the 1-second timeout), and the sentinel isn't actually "impossible" given the missing clamp.)
-            tft.print("RPM: ");
-            tft.print(currentRpm);
-            tft.print("   "); // works like a "smart eraser"
+            char rpmBuffer[16]; // Προσωρινή μνήμη 16 bytes
+
+            // Φορμάρει το string με σταθερό πλάτος
+            snprintf(rpmBuffer, sizeof(rpmBuffer), "RPM: %5" PRIu32, currentRpm);
+
+            tft.setCursor(TFT_RPM_X, TFT_RPM_Y);
+            tft.print(rpmBuffer); // Τυπώνει το έτοιμο string, κάνοντας τέλειο overwrite
+
             Serial.printf("RPM: %" PRIu32 "\n", currentRpm);
             lastRpmState = currentRpm;
         }
